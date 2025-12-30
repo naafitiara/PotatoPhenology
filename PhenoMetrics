@@ -1,0 +1,53 @@
+var classificationAsset = ee.Image('projects/');
+
+var ps = ee.ImageCollection('projects/')
+  .filterDate(startDate, endDate)
+  .filterBounds(roi);
+print('Original collection size:', ps.size());
+
+// Mask and Generate Vegetation Indices
+var ps = ps.map(function(im) {
+  var classificationBand = classificationAsset.select('classification');
+  var potatoMask = classificationBand.eq(1);
+  potatoMask = potatoMask.reproject(im.projection());
+  
+  // Rescale bands
+  var BLUE = im.select('b2').multiply(0.0001);
+  var GREEN = im.select('b4').multiply(0.0001);
+  var RED = im.select('b6').multiply(0.0001);
+  var redEdge = im.select('b7').multiply(0.0001);
+  var NIR = im.select('b8').multiply(0.0001);
+  
+  // Generate VIs
+  var ndvi  = im.normalizedDifference(['b8', 'b6'])
+    .rename(['NDVI']).toFloat().clamp(-1, 1);
+    
+  var evi   = NIR.subtract(RED).multiply(2.5)
+    .divide(NIR.add(RED.multiply(6)).subtract(BLUE.multiply(7.5)).add(1))
+    .rename('EVI').toFloat().clamp(-1, 1);
+    
+  var savi  = NIR.subtract(RED).multiply(1.5)
+    .divide(NIR.add(RED).add(0.5))
+    .rename('SAVI').toFloat().clamp(-1, 1);
+    
+  var tcari = redEdge.subtract(RED)
+    .multiply(3)
+    .subtract(redEdge.subtract(GREEN)
+      .multiply(0.2)
+      .multiply(redEdge.divide(RED)))
+    .rename('TCARI').toFloat().clamp(-10, 10);
+    
+  var ci    = NIR.divide(redEdge).subtract(1).rename('CI')
+    .toFloat().clamp(0, 20);
+    
+  var cvi   = NIR.multiply(RED.divide(GREEN.pow(2))).rename('CVI')
+    .toFloat().clamp(0, 50);
+  
+  // Select VI of Interest
+  var bio = ndvi.addBands(evi).addBands(savi).addBands(tcari).addBands(ci).addBands(cvi)
+    .select(vegIndex).rename('bio');
+  
+  return bio.where(bio.lt(threshMin), threshMin).toFloat()
+    .updateMask(potatoMask)
+    .set('system:time_start', im.get('system:time_start'));
+});
