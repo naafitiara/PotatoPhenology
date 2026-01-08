@@ -1,34 +1,274 @@
+// Import libraries
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import seaborn as sns
+
+from datetime import datetime
+from matplotlib.lines import Line2D
+from matplotlib.dates import DateFormatter
+
+// Function to load data time series
 def load_data(csv_file, start_date, end_date):
-    print(f"\n" + "="*80)
-    print("STEP 1: LOADING DATA CSV")
-    print("="*80)
+    evi_data = pd.read_csv(csv_file, usecols=['field_id', 'date', 'median'], parse_dates=['date'])
 
-    ndvi_data = pd.read_csv(csv_file,
-                            usecols=['field_id', 'date', 'median'],
-                            parse_dates=['date'])
-
-    # Filter by date range
     start_date = pd.to_datetime(start_date)
     end_date = pd.to_datetime(end_date)
 
-    filtered_data = ndvi_data[
-        (ndvi_data['date'] >= start_date) &
-        (ndvi_data['date'] <= end_date)
-    ].copy()
-
-    print(f"  📅 After date filter: {len(filtered_data):,} rows")
-    print(f"  📊 Date range: {filtered_data['date'].min()} to {filtered_data['date'].max()}")
-
-    # Sort by field_id and date
+    filtered_data = evi_data[(evi_data['date'] >= start_date) & (evi_data['date'] <= end_date)].copy()
     filtered_data = filtered_data.sort_values(['field_id', 'date'])
-    print(f"  ✅ Data sorted by field_id and date")
 
-    # Aggregate by field and date (median)
-    aggregated_data = filtered_data.groupby(['field_id', 'date']).agg({
-        'median': 'median'
-    }).reset_index()
-
-    del ndvi_data, filtered_data
-    gc.collect()
-
+    aggregated_data = filtered_data.groupby(['field_id', 'date']).agg({'median': 'median'}).reset_index()
     return aggregated_data
+
+// Function to calculate derivatives
+def calculate_derivative(dates, evi_smoothed, smooth_sigma):
+    dt = np.diff([pd.Timestamp(d).toordinal() for d in dates])
+    dt_mean = dt.mean() if len(dt) > 0 and dt.mean() > 0 else 1.0
+
+    # First Derivative
+    first_derivative = np.gradient(evi_smoothed, dt_mean)
+    first_derivative_smooth = gaussian_filter1d(first_derivative, sigma=smooth_sigma)
+
+    # Second Derivative
+    second_derivative = np.gradient(first_derivative_smooth, dt_mean)
+    second_derivative_smooth = gaussian_filter1d(second_derivative, sigma=smooth_sigma)
+
+    return first_derivative_smooth, second_derivative_smooth
+
+// PHENOLOGY EXTRACTION
+def phenology_extraction_method(dates, evi_smoothed, first_deriv, second_deriv, min_sustained_days=6, threshold=0.001):
+    phases = {}
+    n = len(dates)
+    dates_dt = pd.to_datetime(dates)
+
+    try:
+        // FLOWERING PHASE
+        pos_idx = np.argmax(evi_smoothed)
+        peak_evi = evi_smoothed[pos_idx]
+        phases['flowering'] = {
+            'index'         : int(pos_idx),
+            'date'          : dates_dt[pos_idx].strftime('%Y-%m-%d'),
+            'evi'           : float(peak_evi),
+            'first_deriv'   : float(first_deriv[pos_idx]),
+            'second_deriv'  : float(second_deriv[pos_idx]),
+            'phase_name'    : 'Flowering'
+        }
+
+        // EMERGENCE PHASE
+        positive_slopes = first_deriv[first_deriv > 0]
+        if len(positive_slopes) > 0:
+            slope_75th = np.percentile(positive_slopes, 75)
+        else:
+            slope_75th = np.max(first_deriv) * 0.1
+
+        sos_idx = None
+        min_sustained_days = 6
+        for i in range(1, pos_idx):
+            if first_deriv[i] > slope_75th and evi_smoothed[i] < peak_evi * 0.5:
+                search_end = min(i + min_sustained_days, pos_idx)
+                sustained_region = first_deriv[i:search_end]
+
+                positive_count = np.sum(sustained_region > 0)
+                sustained_ratio = positive_count / len(sustained_region)
+                if sustained_ratio >= 0.8:
+                    sos_idx = i
+                    break
+
+        if sos_idx is None:
+            evi_before_flower = evi_smoothed[:pos_idx]
+            sos_threshold = np.percentile(evi_before_flower, 25)
+            for i in range(pos_idx):
+                if evi_smoothed[i] >= sos_threshold and first_deriv[i] > 0:
+                    sos_idx = i
+                    break
+
+        if sos_idx is None:
+            sos_idx = max(0, int(pos_idx * 0.05))
+        emergence_idx = sos_idx
+        phases['emergence'] = {
+            'index'         : int(emergence_idx),
+            'date'          : dates_dt[emergence_idx].strftime('%Y-%m-%d'),
+            'evi'           : float(evi_smoothed[emergence_idx]),
+            'first_deriv'   : float(first_deriv[emergence_idx]),
+            'second_deriv'  : float(second_deriv[emergence_idx]),
+            'phase_name'    : 'Emergence',
+            'method'        : 'sustained_slope_detection'
+        }
+
+        // PLANTING TIME
+        planting_idx = None
+        planting_method = 'not_detected'
+
+        search_window = range(0, emergence_idx)
+        if len(search_window) > 5:
+            # Method 1: Find local miminim around 0.1
+            bare_soil_range = (0.05, 0.15)
+
+            candidates = []
+            for i in search_window:
+                if bare_soil_range[0] <= evi_smoothed[i] <= bare_soil_range[1]:
+                    is_local_min = True
+                    window_size = 3
+
+                    for j in range(max(0, i - window_size), min(n, i + window_size+1)):
+                        if j != i and evi_smoothed[j] < evi_smoothed[i]:
+                            is_local_min = False
+                            break
+
+                    if is_local_min:
+                        candidates.append((i, evi_smoothed[i]))
+
+            if candidates:
+                candidates.sort(key=lambda x: (emergence_idx - x[0], x[1]))
+                planting_idx = candidates[0][0]
+                planting_method = 'local_minimum_near_0.1'
+
+            if planting_idx is None:
+                evi_before_emergence = evi_smoothed[:emergence_idx]
+                if len(evi_before_emergence) > 0:
+                    planting_idx = np.argmin(evi_before_emergence)
+                    planting_method = 'absolute_minimum'
+
+            if planting_idx is None:
+                planting_idx = 0
+                planting_method = 'time_series_start'
+
+            phases['planting'] = {
+                'index'         : int(planting_idx),
+                'date'          : dates_dt[planting_idx].strftime('%Y-%m-%d'),
+                'evi'           : float(evi_smoothed[planting_idx]),
+                'first_deriv'   : float(first_deriv[planting_idx]),
+                'second_deriv'  : float(second_deriv[planting_idx]),
+                'phase_name'    : 'Planting',
+                'method'        : planting_method,
+                'dap'           : 0
+            }
+
+        // VEGETATIVE PHASE
+        growth_phase = (sos_idx, pos_idx)
+        mask_growth = np.zeros(n, dtype=bool)
+        mask_growth[growth_phase[0]:growth_phase[1]+1] = True
+        mask_growth &= (first_deriv > 0)
+
+        if np.any(mask_growth):
+            growth_indices = np.where(mask_growth)[0]
+            second_deriv_growth = second_deriv[growth_indices]
+            veg_idx_local = np.argmin(second_deriv_growth)
+            veg_idx = growth_indices[veg_idx_local]
+
+            phases['vegetative'] = {
+                'index'         : int(veg_idx),
+                'date'          : dates_dt[veg_idx].strftime('%Y-%m-%d'),
+                'evi'           : float(evi_smoothed[veg_idx]),
+                'first_deriv'   : float(first_deriv[veg_idx]),
+                'second_deriv'  : float(second_deriv[veg_idx]),
+                'rate'          : float(first_deriv[veg_idx]),
+                'phase_name'    : 'Vegetative'
+            }
+
+        // SENESCENCE PHASE
+        sen_search_start = pos_idx + 5
+        sen_search_end = min(int(n * 0.85), n - 5)
+
+        if sen_search_end > sen_search_start:
+            mask_senescence = np.zeros(n, dtype=bool)
+            mask_senescence[sen_search_start:sen_search_end+1] = True
+            mask_senescence &= (first_deriv < -0.001)
+
+            if np.any(mask_senescence):
+                sen_indices = np.where(mask_senescence)[0]
+                second_deriv_sen = second_deriv[sen_indices]
+                sen_idx_local = np.argmin(second_deriv_sen)
+                sen_idx = sen_indices[sen_idx_local]
+
+                phases['senescence'] = {
+                    'index'         : int(sen_idx),
+                    'date'          : dates_dt[sen_idx].strftime('%Y-%m-%d'),
+                    'evi'           : float(evi_smoothed[sen_idx]),
+                    'first_deriv'   : float(first_deriv[sen_idx]),
+                    'second_deriv'  : float(second_deriv[sen_idx]),
+                    'rate'          : float(first_deriv[sen_idx]),
+                    'phase_name'    : 'Senescence'
+                }
+
+        // HARVEST TIME
+        harvest_search_start = pos_idx + 50 if 'senescence' not in phases else phases['senescence']['index'] + 10
+        harvest_search_end = min(int(n * 0.95), n - 2)
+
+        if harvest_search_end > harvest_search_start:
+            mask_harvest = np.zeros(n, dtype=bool)
+            mask_harvest[harvest_search_start:harvest_search_end+1] = True
+            mask_harvest &= (first_deriv < 0)
+
+            if np.any(mask_harvest):
+                harvest_indices = np.where(mask_harvest)[0]
+                second_deriv_harvest = second_deriv[harvest_indices]
+                harvest_idx_local = np.argmax(second_deriv_harvest)
+                harvest_idx = harvest_indices[harvest_idx_local]
+
+                phases['harvest'] = {
+                    'index'         : int(harvest_idx),
+                    'date'          : dates_dt[harvest_idx].strftime('%Y-%m-%d'),
+                    'evi'           : float(evi_smoothed[harvest_idx]),
+                    'first_deriv'   : float(first_deriv[harvest_idx]),
+                    'second_deriv'  : float(second_deriv[harvest_idx]),
+                    'phase_name'    : 'Harvest'
+                }
+            else:
+                harvest_idx = harvest_search_end
+                phases['harvest'] = {
+                    'index'         : int(harvest_idx),
+                    'date'          : dates_dt[harvest_idx].strftime('%Y-%m-%d'),
+                    'evi'           : float(evi_smoothed[harvest_idx]),
+                    'first_deriv'   : float(first_deriv[harvest_idx]),
+                    'second_deriv'  : float(second_deriv[harvest_idx]),
+                    'phase_name'    : 'Harvest'
+                }
+
+        // Calculate Days After Planting (DAP)
+        if 'planting' in phases:
+            planting_date = pd.Timestamp(phases['planting']['date'])
+
+            for phase_key in ['emergence', 'vegetative', 'flowering', 'senescence', 'harvest']:
+                if phase_key in phases:
+                    phase_date = pd.Timestamp(phases[phase_key]['date'])
+                    dap = (phase_date - planting_date).days
+                    phases[phase_key]['dap'] = int(dap)
+
+        // Calculate Season Metrics
+        if 'planting' in phases and 'harvest' in phases:
+            total_season = (pd.Timestamp(phases['harvest']['date']) -
+                            pd.Timestamp(phases['planting']['date'])).days
+            phases['total_season_length'] = int(total_season)
+
+        if 'emergence' in phases and 'harvest' in phases:
+            season_duration = (pd.Timestamp(phases['harvest']['date']) -
+                               pd.Timestamp(phases['emergence']['date'])).days
+            phases['season_length'] = int(season_duration)
+        else:
+            phases['season_length'] = None
+
+        if 'vegetative' in phases and 'flowering' in phases:
+            greenup_duration = (pd.Timestamp(phases['flowering']['date']) -
+                                pd.Timestamp(phases['vegetative']['date'])).days
+            phases['greenup_duration'] = int(greenup_duration)
+        else:
+            phases['greenup_duration'] = None
+
+        if 'senescence' in phases and 'flowering' in phases:
+            senescence_duration = (pd.Timestamp(phases['harvest']['date']) -
+                                   pd.Timestamp(phases['senescence']['date'])).days
+            phases['senescence_duration'] = int(senescence_duration)
+        else:
+            phases['senescence_duration'] = None
+
+        # Store derivatives for visualization
+        phases['_first_derivative'] = first_deriv
+        phases['_second_derivative'] = second_deriv
+
+        return phases, None
+
+    except Exception as e:
+        return {}, f"Extraction error: {str(e)[:100]}"
