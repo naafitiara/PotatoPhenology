@@ -1,19 +1,25 @@
-
+// The present code was modified and implemented from the work of Adrià Descals
+// URL : https://github.com/adriadescals/LandSurfacePhenology_Sentinel2.git
 
 // PARAMETER SETTINGS
 Map.centerObject(roi, 15)
 var vegIndex = 'NDVI';
+var thresholdPercent = 0.15;
+var threshMin = 0.20;
+var scale = 3;
+var lag = 5;
 
+var year1 = 2024;
+var startDate = year1 + '-05-01';
+var endDate = year1 + '-10-31';
 
+// Load Potato Classification data
+var classificationAsset = ee.Image('projects/ee-');
 
-
-
-var classificationAsset = ee.Image('projects/');
-
-var ps = ee.ImageCollection('projects/')
+// Load PlanetScope time series data
+var ps = ee.ImageCollection('projects/ee-')
   .filterDate(startDate, endDate)
   .filterBounds(roi);
-print('Original collection size:', ps.size());
 
 // Mask and Generate Vegetation Indices
 var ps = ps.map(function(im) {
@@ -21,7 +27,6 @@ var ps = ps.map(function(im) {
   var potatoMask = classificationBand.eq(1);
   potatoMask = potatoMask.reproject(im.projection());
   
-  // Rescale bands
   var BLUE = im.select('b2').multiply(0.0001);
   var GREEN = im.select('b4').multiply(0.0001);
   var RED = im.select('b6').multiply(0.0001);
@@ -53,7 +58,7 @@ var ps = ps.map(function(im) {
   var cvi   = NIR.multiply(RED.divide(GREEN.pow(2))).rename('CVI')
     .toFloat().clamp(0, 50);
   
-  // Select VI of Interest
+  // Select VI of interest
   var bio = ndvi.addBands(evi).addBands(savi).addBands(tcari).addBands(ci).addBands(cvi)
     .select(vegIndex).rename('bio');
   
@@ -61,3 +66,203 @@ var ps = ps.map(function(im) {
     .updateMask(potatoMask)
     .set('system:time_start', im.get('system:time_start'));
 });
+
+// Create Composites
+var listDates = ee.List.sequences(
+  ee.Date(startDate).millis(),
+  ee.Date(endDate).millis(), 86400000 * lag);
+
+var colDekads = ee.ImageCollection(listDates.map(function(dd) {
+  var date_window = ee.Date(ee.Number(dd));
+  var lag_float = ee. Number(lag);
+  date_startW = date_window.advance(lag_float.divide(-2), 'days');
+  date_endW = date_window.advance(lag_float.divide(2), 'days);
+  var col_window = ps.filterDate(date_startW, date_endW);
+  var count = col_window.size();
+
+  var composite = ee.Algorithm.If(
+    count.gt(0),
+    col_window.reduce(ee.Reducer.mean()),
+    ee.Image.constant(threshMin).rename('bio_mean'));
+
+  return ee.Image(composite).toFloat().clamp(-1,1).set('system:time_start', date_window.millis()).set('n_images', count);
+}));
+
+// Cast to ensure all images are consistent
+colDekads = colDekads.map(function(im) {
+  return im.select('bio_mean')
+    .toFloat()
+    .clamp(-1, 1)
+    .copyProperties(im, ['system:time_start', 'n_images']);
+});
+
+var nComposites = colDekads.size();
+var validComposites = colDekads.filterMetadata('n_images', 'greater_than', 0);
+
+// Function to Cubic Interpolation method
+var cubicInterpolation = function(collection, step) {
+  var collSize = collection.size();
+  var listDekads = ee.List.sequence(1, collSize.subtract(3), 1);
+  var colInterp = listDekads.map(function(ii) {
+    ii = ee.Number(ii);
+
+    var p0 = ee.Image(collection.toList(10000).get(ii.subtract(1)));
+    var p1 = ee.Image(collection.toList(10000).get(ii));
+    var p2 = ee.Image(collection.toList(10000).get(ii.add(1)));
+    var p3 = ee.Image(collection.toList(10000).get(ii.add(2)));
+
+    var diff01 = ee.Date(p1.get('system:time_start')).difference(ee.Date(p0.get('system:time_start')), 'day');
+    var diff12 = ee.Date(p2.get('system:time_start')).difference(ee.Date(p1.get('system:time_start')), 'day');
+    var diff23 = ee.Date(p3.get('system:time_start')).difference(ee.Date(p2.get('system:time_start')), 'day');
+    
+    var diff01nor = diff01.divide(diff12);
+    var diff12nor = diff12.divide(diff12);
+    var diff23nor = diff23.divide(diff12);
+    
+    var f0 = p1.select('bio_mean');
+    var f1 = p2.select('bio_mean');
+    var f0p = (p2.select('bio_mean').subtract(p0.select('bio_mean'))).divide(diff01nor.add(diff12nor));
+    var f1p = (p3.select('bio_mean').subtract(p1.select('bio_mean'))).divide(diff12nor.add(diff23nor));
+
+    var a = (f0.multiply(2)).subtract(f1.multiply(2)).add(f0p).add(f1p);
+    var b = (f0.multiply(-3)).add(f1.multiply(3)).subtract(f0p.multiply(2)).subtract(f1p);
+    var c = f0p;
+    var d = f0;
+    
+    var xValues = ee.List.sequence(0, diff12.subtract(1), step);
+    var xDates = ee.List.sequence(p1.get('system:time_start'), ee.Number(p1.get('system:time_start')).add(diff12.multiply(86400000)), 86400000);
+
+    var interp = xValues.map(function(x) {
+      var t = ee.Image(ee.Number(x).divide(diff12));
+      return (t.pow(3)).multiply(a).add((t.pow(2)).multiply(b)).add(t.multiply(c)).add(d)
+        .rename('bio_daily').toFloat().clamp(-1, 1).set('system:time_start', ee.Number(xDates.get(x)));
+    });
+    return interp;
+  });
+  return ee.ImageCollection(colInterp.flatten());
+};
+
+// Apply Cubic Interpolation to Create Daily data time series
+var dailyInterpolated = cubicInterpolation(colDekads, 1);
+
+// Ensure consistent data type and band name
+dailyInterpolated = dailyInterpolated.map(function(im) {
+  return im.select('bio_daily').toFloat().clamp(-1, 1)
+    .copyProperties(im, ['system:time_start']);
+});
+
+// Load Saviztky-Golay smoothing function
+var oeel = require('users/OEEL/lib:loadAll');
+// https://www.open-geocomputing.org/OpenEarthEngineLibrary/
+
+// Use the default distanceFunction
+var distanceFunction = function(informedImage, estimationImage) {
+  return ee.Image.constant(
+    ee.Number(informedImage.get('system:time_start'))
+      .subtract(ee.Number(estimationImage.get('system:time_start')))
+  );
+};
+
+// Set Savitzky-Golay Parameter
+var windowSize = 31;
+var polynomialOrder = 3;
+
+// Calculate maxDiffFilter
+var halfWindow = Math.floor(windowSize / 2);
+var maxDiffMillis = 1000 * 86400 * halfWindow;  // Convert to milliseconds
+
+var maxDiffFilter = ee.Filter.maxDifference({
+  difference  : maxDiffMillis,
+  leftField   : 'system:time_start',
+  rightField  : 'system:time_start'
+});
+
+// Apply Savitzky-Golay filter
+var sgSmoothed = oeel.ImageCollection.SavatskyGolayFilter(
+  dailyInterpolated.select('bio_daily'),
+  maxDiffFilter,
+  distanceFunction,
+  polynomialOrder
+);
+
+var sgSmoothed = sgSmoothed.map(function(im) {
+  return im.select(['d_0_bio_daily'], ['bio_smooth'])
+    .toFloat().clamp(-1, 1)
+    .copyProperties(im, ['system:time_start']);
+});
+
+// PHENOLOGY METRICS COMPUTATION
+var init = ee.Image(ee.Date((year1-1) + '-12-31').millis());
+var finalData = sgSmoothed.map(function(im) {
+  var timestamp = ee.Image.constant(ee.Number(im.get('system:time_start'))).toFloat().rename('date1');
+  return im.select('bio_smooth').rename('bio_final').toFloat()
+    .addBands(timestamp)
+    .set('system:time_start', im.get('system:time_start'));
+});
+
+// Estimate amplitude of time series
+var minND = finalData.select('bio_final').min();
+var maxND = finalData.select('bio_final').max();
+var amplitude = maxND.subtract(minND);
+
+// Get sample point statistics
+var sampleMin = minND.reduceRegion(ee.Reducer.first(), point, scale).get('bio_final');
+var sampleMax = maxND.reduceRegion(ee.Reducer.first(), point, scale).get('bio_final');
+var sampleAmp = amplitude.reduceRegion(ee.Reducer.first(), point, scale).get('bio_final');
+
+// Threshold image computation
+var threshold = minND.add(amplitude.multiply(thresholdPercent)).rename('bio_final');
+var sampleThresh = threshold.reduceRegion(ee.Reducer.first(), point, scale).get('bio_final');
+
+// Mask value below threshold
+var col_aboveThresh = finalData.map(function(im) {
+  var above = im.select('bio_final').gt(threshold);
+  var dateFloat = im.select('date1').toFloat();
+  return dateFloat.updateMask(above).copyProperties(im, ['system:time_start']);
+});
+
+// START OF SEASON (SOS)
+var SoS = col_aboveThresh.select('date1').reduce(ee.Reducer.firstNonNull()).rename('SoS');
+var SoS_doy = SoS.subtract(init).divide(86400000).toInt().rename('SoS_DOY');
+
+// PEAK OF SEASON (POS)
+var col_withMax = finalData.map(function(im) {
+  var isMax = im.select('bio_final').eq(maxND);
+  return im.updateMask(isMax)
+    .copyProperties(im, ['system:time_start']);
+});
+
+var PoS = col_withMax.select('date1').reduce(ee.Reducer.firstNonNull()).rename('PoS');
+var PoS_doy = PoS.subtract(init).divide(86400000).toInt().rename('PoS_DOY');
+
+// END OF SEASON
+var EoS = col_aboveThresh.select('date1').reduce(ee.Reducer.lastNonNull()).rename('EoS');
+var EoS_doy = EoS.subtract(init).divide(86400000).toInt().rename('EoS_DOY');
+
+// LENGTH OF SEASON
+var LoS = EoS_doy.subtract(SoS_doy).rename('LoS');
+
+// RESULTS VISUALIZATION
+var phenoStats = {
+  'SoS_DOY': SoS_doy.reduceRegion(ee.Reducer.first(), point, scale).get('SoS_DOY'),
+  'PoS_DOY': PoS_doy.reduceRegion(ee.Reducer.first(), point, scale).get('PoS_DOY'),
+  'EoS_DOY': EoS_doy.reduceRegion(ee.Reducer.first(), point, scale).get('EoS_DOY'),
+  'LoS': LoS.reduceRegion(ee.Reducer.first(), point, scale).get('LoS'),
+};
+
+// Combine all phenology metrics
+var phenologyMetrics = SoS_doy
+  .addBands(PoS_doy)
+  .addBands(EoS_doy)
+  .addBands(LoS);
+
+// Visualization parameters
+var sosVis = {min: 120, max: 200, palette: ['#ffffcc', '#ffeda0', '#fed976', '#feb24c', '#fd8d3c', '#fc4e2a', '#e31a1c', '#bd0026']};
+var posVis = {min: 150, max: 230, palette: ['#f7fcf5', '#e5f5e0', '#c7e9c0', '#a1d99b', '#74c476', '#41ab5d', '#238b45', '#006d2c']};
+var eosVis = {min: 200, max: 280, palette: ['#fff7ec', '#fee8c8', '#fdd49e', '#fdbb84', '#fc8d59', '#ef6548', '#d7301f', '#990000']};
+var losVis = {min: 50, max: 130, palette: ['#f7fbff', '#deebf7', '#c6dbef', '#9ecae1', '#6baed6', '#4292c6', '#2171b5', '#084594']};
+
+// Add layers to map
+Map.addLayer(SoS_doy.clip(roi), sosVis, 'Start of Season (DOY)', true);
+Map.addLayer(PoS_doy.clip(roi), posVis, 'Peak of Season (DOY)', false);
+Map.addLayer(EoS_doy.clip(roi), eosVis, 'End of Season (DOY)', true);
