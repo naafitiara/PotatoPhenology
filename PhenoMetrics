@@ -1,3 +1,13 @@
+
+
+// PARAMETER SETTINGS
+Map.centerObject(roi, 15)
+var vegIndex = 'NDVI';
+
+
+
+
+
 var classificationAsset = ee.Image('projects/');
 
 var ps = ee.ImageCollection('projects/')
